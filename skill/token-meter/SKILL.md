@@ -1,52 +1,44 @@
 ---
 name: token-meter
-description: Mostra in cima a ogni risposta una barra compatta di 10 quadrati colorati con una stima dei token (contesto) rimasti nella conversazione. Usa SEMPRE questa skill quando l'utente parla di token rimasti, contesto residuo, limite della conversazione, "quanto spazio mi resta", barra di avanzamento dei token, o chiede un indicatore/widget di consumo, anche se non nomina la skill. Show a 10-square colored bar with remaining-token estimate at the top of every reply. Use when the user mentions remaining tokens, context left, usage meter, or token widget.
+description: Barra di 10 quadrati colorati con stima dei token di contesto rimasti, come prima riga di ogni risposta. Usala quando l'utente parla di token rimasti, contesto residuo, limite della conversazione, "quanto spazio mi resta", barra o widget di consumo token, o chiede di monitorare la lunghezza della chat. Shows a 10-square colored bar estimating remaining context tokens at the top of every reply. Use when the user mentions remaining tokens, context left, usage meter, or token widget.
 ---
 
 # Token Meter
 
-Indicatore minimale dei token rimasti: una barra di 10 quadrati colorati, mostrata come **prima riga di ogni risposta**.
+Indicatore dei token di contesto rimasti: barra di 10 quadrati, prima riga di ogni risposta.
 
-## Importante: è una stima
+## È una stima, non una misura
 
-Claude non ha un contatore esatto dei token residui. Il valore va stimato e va sempre presentato con il simbolo `~`. Non presentarlo mai come un dato preciso.
+Non hai un contatore esatto. Presenta sempre i valori con `~`. Se l'utente chiede numeri esatti, spiega il limite in una frase e segnala che per dati reali esiste la status line di Claude Code.
 
-## Come stimare
+## Metodo di stima (incrementale, non ricalcolare da zero)
 
-1. **Finestra totale**: usa la dimensione del contesto del modello se la conosci. In caso contrario assumi **200.000 token**. (Per cambiare il default, modifica questo numero.)
-2. **Token usati**: stima il testo dell'intera conversazione (messaggi dell'utente, tue risposte, output dei tool, contenuto di file allegati, istruzioni di sistema) con la regola **~4 caratteri = 1 token** (circa 3 per codice, italiano e testo denso).
-3. **Rimasti** = totale − usati, in percentuale sul totale (arrotonda a multipli di 10 per i quadrati, al 5% per il numero mostrato).
+1. **Baseline a inizio chat**: parti da ~8.000 token usati (istruzioni di sistema, preferenze, skill, eventuale knowledge base del progetto). È un'euristica, non un dato.
+2. **A ogni turno**: prendi il valore stimato del turno precedente e aggiungi i token dei nuovi contenuti:
+   - messaggio utente + tua risposta precedente + output di tool + testo di file allegati;
+   - divisore: ~4 caratteri/token per prosa inglese, ~3 per italiano, codice e testo denso;
+   - immagini: ~(larghezza × altezza) / 750 token per immagine (euristica approssimata).
+3. **Monotonia**: nella stessa chat la percentuale rimasta non può aumentare. Se il calcolo la farebbe salire, mantieni il valore precedente. Eccezione: nuova chat o riassunto/compattazione dichiarati dall'utente.
+4. Finestra totale: usa quella del modello se la conosci, altrimenti 200.000.
+5. Clamp sempre tra 0% e 100%.
 
-## Come disegnare la barra
+## Barra
 
-Quadrati pieni = percentuale rimasta ÷ 10, arrotondata. I restanti sono vuoti `⬜`.
+- Quadrati pieni = ⌊percentuale rimasta ÷ 10⌋ (arrotondamento per difetto, conservativo). Vuoti: `⬜`.
+- Numero mostrato: percentuale arrotondata al 5% più vicino.
+- Colore dei pieni: 🟩 se rimasto > 60%; 🟨 se 30% ≤ rimasto ≤ 60%; 🟥 se rimasto < 30%.
+- Lingua: segui la lingua dell'utente. Italiano: `token rimasti`. Inglese: `tokens left`.
 
-Il colore dei quadrati pieni dipende da quanto resta:
+Formato esatto (una sola riga):
 
-| Rimasto | Quadrati pieni |
-|---|---|
-| più del 60% | 🟩 |
-| tra 30% e 60% | 🟨 |
-| meno del 30% | 🟥 |
-
-Formato esatto della riga (una sola riga, nient'altro):
-
-```
 🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ ~70% · ~140k token rimasti
-```
-
-Esempi:
-
-```
-🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜ ~40% · ~80k token rimasti
+🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜ ~40% · ~80k tokens left
 🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜ ~20% · ~40k token rimasti
-```
 
 ## Regole di comportamento
 
-- La barra è **sempre la prima riga** della risposta, seguita da una riga vuota e poi dalla risposta normale.
-- Niente commenti sulla barra, a meno che l'utente non li chieda.
-- Sotto il **15%** aggiungi, dopo la risposta, una sola riga: suggerisci di aprire una nuova conversazione e offriti di scrivere un breve riassunto da portare con sé.
-- Se l'utente scrive "nascondi la barra" (o simili), smetti di mostrarla; riprendi se scrive "mostra la barra".
-- Se l'utente chiede "quanti token mi restano?", rispondi con la barra e spiega in una frase che si tratta di una stima.
-- Se la risposta è un file o un artifact, mostra la barra solo nel testo di chat che lo accompagna, mai dentro il file.
+1. La barra è la prima riga, poi una riga vuota, poi la risposta. Niente commenti sulla barra salvo richiesta.
+2. **Precedenza**: se l'utente impone un formato rigido alla risposta (solo JSON, solo codice, contenuto di un file/artifact), ometti la barra in quell'output. Mai dentro file o artifact; solo nel testo di chat che li accompagna.
+3. Sotto il 15%: aggiungi in fondo una sola riga che suggerisce una nuova chat con riassunto, **una sola volta per attraversamento della soglia**, non a ogni turno.
+4. "Nascondi la barra" (o simili) → smetti per il resto della chat; "mostra la barra" → riprendi.
+5. "Quanti token mi restano?" → barra + una frase che chiarisce che è una stima.

@@ -1,132 +1,195 @@
 #!/usr/bin/env python3
-#
+# -*- coding: utf-8 -*-
 # =============================================================================
-#  Project      : Claude Token Meter
-#  Description  : Colored 10-square bar showing the context tokens left in a
-#                 Claude Code session (status line, Linux / Windows / macOS)
-#  Author       : Raffaele Catapano
-#  License      : MIT (see LICENSE)
-#  Created on   : 13/11/2026
-#  Updated on   : 13/11/2026
-#  Version      : 1.0.0 - Claude Code Status Line
-#
-#  Copyright (c) 2026 Raffaele Catapano
-#  Released under the MIT License - see the LICENSE file for details.
-#  SPDX-License-Identifier: MIT
+#  Project   : Claude Token Meter
+#  Author    : Raffaele Catapano
+#  License   : MIT (SPDX-License-Identifier: MIT)
+#  Version   : 1.1.0 - Claude Code Status Line
+#  Updated   : 21/11/2026
 # =============================================================================
 """
 Claude Token Meter - status line for Claude Code.
-Reads the session JSON from stdin and prints one line, e.g.:
-
-    🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ 70% · 140k left · Opus
-
-Language: set TOKEN_METER_LANG=en|it, otherwise it follows the system locale
-(Italian if the locale starts with "it", English otherwise).
+Reads session JSON from stdin, prints one line, e.g.:
+🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ 70% · 140k left · Opus
+Language: TOKEN_METER_LANG=en|it, else system locale. Stdlib only, Python 3.8+.
 """
 import json
+import math
 import os
+import re
 import sys
 
-DEFAULT_WINDOW = 200_000      # used only if Claude Code does not report the size
-GREEN_ABOVE = 60              # % left above which the bar is green
-YELLOW_ABOVE = 30             # % left above which the bar is yellow (below: red)
-
+DEFAULT_WINDOW = 200_000
+GREEN_ABOVE = 60          # green if remaining > 60
+YELLOW_ABOVE = 30         # yellow if remaining >= 30 (30 included), else red
+TAIL_BYTES = 1_048_576    # transcript fallback: read only the last 1 MiB
 LABELS = {"en": "left", "it": "rimasti"}
+ONE_M_RE = re.compile(r"\[1m\]|\b1m\b", re.IGNORECASE)
 
 
 def detect_language():
-    """Return 'it' or 'en' from TOKEN_METER_LANG or the system locale."""
-    forced = (os.environ.get("TOKEN_METER_LANG") or "").lower()[:2]
+    forced = (os.environ.get("TOKEN_METER_LANG") or "").strip().lower()[:2]
     if forced in LABELS:
         return forced
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
-        value = (os.environ.get(var) or "").lower()
+        value = (os.environ.get(var) or "").strip().lower()
         if value:
             return "it" if value.startswith("it") else "en"
     return "en"
 
 
+def as_number(value):
+    """Coerce to finite float; None on bool/str-garbage/NaN/Inf."""
+    if isinstance(value, bool):
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
 def usage_tokens(usage):
-    """Tokens actually in the context for one API call."""
-    return (
-        (usage.get("input_tokens") or 0)
-        + (usage.get("cache_creation_input_tokens") or 0)
-        + (usage.get("cache_read_input_tokens") or 0)
-    )
+    """Prompt tokens of one API call; accepts dict or plain number."""
+    if not isinstance(usage, dict):
+        return as_number(usage)
+    total = 0.0
+    for key in ("input_tokens", "cache_creation_input_tokens",
+                "cache_read_input_tokens"):
+        n = as_number(usage.get(key))
+        if n is not None and n > 0:
+            total += n
+    return total if total > 0 else None
 
 
 def used_from_transcript(path):
-    """Fallback: read the last 'usage' entry from the JSONL transcript."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except (OSError, TypeError):
+    """Fallback: last main-thread 'usage' from the JSONL transcript tail.
+    Skips sidechain (subagent) entries; adds the last output_tokens because
+    'usage' snapshots the prompt before that completion (approximation)."""
+    if not isinstance(path, str) or not path:
         return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            length = f.tell()
+            start = max(0, length - TAIL_BYTES)
+            f.seek(start)
+            chunk = f.read()
+    except OSError:
+        return None
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # first line may be truncated mid-JSON
     for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        usage = (entry.get("message") or {}).get("usage")
-        if usage:
-            return usage_tokens(usage)
+        if not isinstance(entry, dict) or entry.get("isSidechain"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        tokens = usage_tokens(usage)
+        if tokens is not None:
+            if isinstance(usage, dict):
+                out = as_number(usage.get("output_tokens"))
+                if out is not None and out > 0:
+                    tokens += out
+            return tokens
     return None
 
 
 def fmt_tokens(n):
-    return f"{n / 1000:.0f}k" if n >= 1000 else str(int(n))
+    if n >= 1_000_000 or round(n / 1000) >= 1000:
+        v = f"{n / 1_000_000:.1f}"
+        if v.endswith(".0"):
+            v = v[:-2]
+        return v + "M"
+    if n >= 1000:
+        return f"{round(n / 1000)}k"
+    return str(int(n))
 
 
-def main():
-    try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        data = {}
+def compute_remaining(data):
+    model = data.get("model")
+    model = model if isinstance(model, dict) else {}
+    cw = data.get("context_window")
+    cw = cw if isinstance(cw, dict) else {}
 
-    model = data.get("model") or {}
-    cw = data.get("context_window") or {}
+    size = as_number(cw.get("context_window_size"))
+    if size is None or size <= 0:
+        ident = "{} {}".format(model.get("id") or "",
+                               model.get("display_name") or "")
+        size = 1_000_000 if ONE_M_RE.search(ident) else DEFAULT_WINDOW
 
-    size = cw.get("context_window_size")
-    if not size:
-        size = 1_000_000 if "[1m]" in (model.get("id") or "").lower() else DEFAULT_WINDOW
-
-    # 1) percentage provided directly by Claude Code
-    remaining_pct = cw.get("remaining_percentage")
-    if remaining_pct is None and cw.get("used_percentage") is not None:
-        remaining_pct = 100 - cw["used_percentage"]
-
-    # 2) computed from the last real usage
-    if remaining_pct is None and cw.get("current_usage"):
-        used = usage_tokens(cw["current_usage"])
-        remaining_pct = 100 - used / size * 100
-
-    # 3) fallback: transcript
-    if remaining_pct is None:
+    pct = as_number(cw.get("remaining_percentage"))
+    if pct is None:
+        used_pct = as_number(cw.get("used_percentage"))
+        if used_pct is not None:
+            pct = 100.0 - used_pct
+    if pct is None:
+        used = usage_tokens(cw.get("current_usage"))
+        if used is not None:
+            pct = 100.0 - used / size * 100.0
+    if pct is None:
         used = used_from_transcript(data.get("transcript_path"))
         if used is not None:
-            remaining_pct = 100 - used / size * 100
+            pct = 100.0 - used / size * 100.0
+    if pct is None:
+        pct = 100.0
+    return max(0.0, min(100.0, pct)), size, model
 
-    if remaining_pct is None:        # no data yet (session just started)
-        remaining_pct = 100
 
-    remaining_pct = max(0, min(100, remaining_pct))
-    remaining_tokens = size * remaining_pct / 100
-
-    filled = round(remaining_pct / 10)
-    if remaining_pct > GREEN_ABOVE:
+def render(pct, size, model):
+    filled = int(pct // 10)  # floor: conservative, no banker's rounding
+    if pct > GREEN_ABOVE:
         square = "🟩"
-    elif remaining_pct > YELLOW_ABOVE:
+    elif pct >= YELLOW_ABOVE:
         square = "🟨"
     else:
         square = "🟥"
-
     bar = square * filled + "⬜" * (10 - filled)
-    label = LABELS[detect_language()]
+    parts = [f"{bar} {math.floor(pct)}%",
+             f"{fmt_tokens(size * pct / 100.0)} {LABELS[detect_language()]}"]
     name = model.get("display_name") or ""
-    parts = [f"{bar} {remaining_pct:.0f}%", f"{fmt_tokens(remaining_tokens)} {label}"]
     if name:
-        parts.append(name)
-    print(" · ".join(parts))
+        parts.append(str(name))
+    return " · ".join(parts)
+
+
+def main():
+    # Force UTF-8 on piped stdout/stderr (Windows cp1252 would crash on emoji).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    raw = ""
+    try:
+        if not sys.stdin.isatty():  # manual run without pipe: don't block
+            raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError, AttributeError):
+        raw = ""
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except json.JSONDecodeError:
+        data = {}
+    try:
+        pct, size, model = compute_remaining(data)
+        line = render(pct, size, model)
+    except Exception:
+        line = "⬜" * 10 + " ?"  # degraded mode, never crash the status line
+    try:
+        print(line)
+    except BrokenPipeError:
+        pass
 
 
 if __name__ == "__main__":
